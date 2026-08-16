@@ -591,3 +591,107 @@ async def test_video_timeline_analysis_image_video_integration(monkeypatch, tmp_
     assert "[Frame 1 (00:00)]: frame caption" in out
     assert "[Frame 3 (00:03)]: frame caption" in out
     assert "(3 frames analyzed, 0 failed)" in out
+
+
+def _count_vision_frames_dirs():
+    """Count leftover vision_frames_* dirs in the OS temp dir."""
+    import tempfile
+    from pathlib import Path
+
+    tdir = Path(tempfile.gettempdir())
+    return len(list(tdir.glob("vision_frames_*")))
+
+
+def _install_fake_subprocess(monkeypatch, *, duration="10.0", fail=None):
+    """Monkeypatch srv.subprocess.run with a controllable fake.
+
+    The ffprobe duration call returns ``duration`` (or raises if ``fail`` is
+    set). The ffmpeg frame call writes an output file (so frames can be
+    non-empty) unless ``fail`` is set.
+    """
+    import mcp_proxy_vision.server as srv
+    from pathlib import Path
+
+    def fake_run(args, *a, **kw):
+        if fail:
+            raise RuntimeError(fail)
+        if "-show_entries" in args:
+            return type("R", (), {"stdout": duration})()
+        # ffmpeg call: last arg is the output frame path
+        outfile = Path(args[-1])
+        outfile.write_bytes(b"fake-frame")
+        return type("R", (), {"stdout": ""})()
+
+    monkeypatch.setattr(srv.subprocess, "run", fake_run)
+
+
+def test_extract_frames_cleans_up_on_empty(monkeypatch, tmp_path):
+    """Empty result (unknown duration) → temp dir is removed, no leak."""
+    import mcp_proxy_vision.server as srv
+    from pathlib import Path
+
+    # duration=0 → max_frames becomes 1, but ffmpeg writes nothing usable; the
+    # fake writes a file so frames WOULD be non-empty — to force empty, give a
+    # duration that yields 0 frames. Use duration="0" → max_frames=1 → one
+    # ffmpeg call that still writes → non-empty. So to test EMPTY, make the
+    # ffmpeg call raise too (covered by fail). Instead: make duration parse to 0
+    # AND have the frame file not exist — simpler: fail on the ffmpeg path only.
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"x")
+
+    # Force empty: duration=0 (unknown), and ffmpeg writes nothing.
+    def fake_run(args, *a, **kw):
+        if "-show_entries" in args:
+            return type("R", (), {"stdout": "0"})()  # duration 0 → 1 frame attempt
+        # ffmpeg call → DON'T write the file so frames stays empty
+        return type("R", (), {"stdout": ""})()
+
+    monkeypatch.setattr(srv.subprocess, "run", fake_run)
+
+    before = _count_vision_frames_dirs()
+    frames = srv._extract_frames(vid, max_frames=10)
+    after = _count_vision_frames_dirs()
+
+    assert frames == []
+    assert after == before  # no new vision_frames_* dir leaked
+
+
+def test_extract_frames_cleans_up_on_throw(monkeypatch, tmp_path):
+    """An exception during extraction → temp dir is removed, no leak."""
+    import mcp_proxy_vision.server as srv
+    from pathlib import Path
+
+    _install_fake_subprocess(monkeypatch, fail="ffprobe exploded")
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"x")
+
+    before = _count_vision_frames_dirs()
+    try:
+        srv._extract_frames(vid, max_frames=10)
+        assert False, "expected an exception"
+    except RuntimeError:
+        pass
+    after = _count_vision_frames_dirs()
+
+    assert after == before  # no vision_frames_* dir leaked on throw
+
+
+def test_extract_frames_success_leaves_dir_for_caller(monkeypatch, tmp_path):
+    """Success → frames returned and the temp dir is LEFT for the caller."""
+    import mcp_proxy_vision.server as srv
+    from pathlib import Path
+
+    _install_fake_subprocess(monkeypatch, duration="10.0")
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"x")
+
+    before = _count_vision_frames_dirs()
+    frames = srv._extract_frames(vid, max_frames=2)
+    after = _count_vision_frames_dirs()
+
+    assert len(frames) == 2  # success returns frames
+    assert after == before + 1  # the temp dir is LEFT for the caller
+    # Caller's cleanup removes it:
+    import shutil
+    shutil.rmtree(frames[0][0].parent, ignore_errors=True)
+    assert _count_vision_frames_dirs() == before

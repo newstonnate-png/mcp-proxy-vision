@@ -18,6 +18,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -441,39 +442,57 @@ def _extract_frames(video_path: Path, max_frames: int = 10) -> list[tuple[Path, 
     """Extract up to max_frames evenly-spaced frames from a video via ffmpeg.
 
     Returns a list of (frame_path, seconds) tuples. Uses ffprobe to get
-    duration, then samples evenly. Frames go to a fresh temp dir.
+    duration, then samples evenly. Frames go to a fresh temp dir whose name
+    includes the sanitized video stem for traceability.
+
+    The temp dir is GUARANTEED to be removed on any non-success outcome — a
+    thrown exception or an empty result cleans it up here — so no orphan
+    ``vision_frames_*`` dirs leak. On success (non-empty frames) the dir is left
+    for the caller to remove after captioning.
     """
     ffprobe = _ffprobe_path()
     ffmpeg = _ffmpeg_path()
 
-    # Get duration via ffprobe (blocking call — runs in a thread).
-    try:
-        dur_probe = subprocess.run(
-            [str(ffprobe), "-v", "quiet", "-show_entries", "format=duration",
-             "-of", "csv=p=0", str(video_path)],
-            capture_output=True, text=True, timeout=30,
-        )
-        duration = float(dur_probe.stdout.strip())
-    except Exception:
-        duration = 0.0
-
-    if duration <= 0:
-        max_frames = 1  # unknown duration: just grab the first frame
-
-    n = max(1, min(max_frames, int(duration) if duration else 1))
-    tmpdir = Path(tempfile.mkdtemp(prefix="vision_frames_"))
+    # Sanitize the video stem so it's safe as a directory-name component.
+    stem = re.sub(r"[^\w\-]", "_", video_path.stem) or "video"
+    tmpdir = Path(tempfile.mkdtemp(prefix=f"vision_frames_{stem}_"))
     frames: list[tuple[Path, float]] = []
-    for i in range(n):
-        t = (duration * i / max(1, n - 1)) if duration > 0 and n > 1 else 0.0
-        out = tmpdir / f"frame_{i:03d}.png"
-        subprocess.run(
-            [str(ffmpeg), "-y", "-ss", f"{t:.2f}", "-i", str(video_path),
-             "-frames:v", "1", str(out)],
-            capture_output=True, timeout=30,
-        )
-        if out.exists():
-            frames.append((out, t))
-    return frames
+    try:
+        # Get duration via ffprobe (blocking call — runs in a thread).
+        try:
+            dur_probe = subprocess.run(
+                [str(ffprobe), "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(video_path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            duration = float(dur_probe.stdout.strip())
+        except Exception:
+            duration = 0.0
+
+        if duration <= 0:
+            max_frames = 1  # unknown duration: just grab the first frame
+
+        n = max(1, min(max_frames, int(duration) if duration else 1))
+        for i in range(n):
+            t = (duration * i / max(1, n - 1)) if duration > 0 and n > 1 else 0.0
+            out = tmpdir / f"frame_{i:03d}.png"
+            subprocess.run(
+                [str(ffmpeg), "-y", "-ss", f"{t:.2f}", "-i", str(video_path),
+                 "-frames:v", "1", str(out)],
+                capture_output=True, timeout=30,
+            )
+            if out.exists():
+                frames.append((out, t))
+    except Exception:
+        # No leak on a thrown extraction error — the caller will surface ERROR,
+        # but the frames dir is removed here.
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+    else:
+        if not frames:
+            # No leak on empty result — remove the dir before returning [].
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return frames
 
 
 @mcp.tool()
