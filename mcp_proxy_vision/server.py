@@ -14,6 +14,8 @@
 import asyncio
 import base64
 import contextlib
+import hashlib
+import json
 import mimetypes
 import os
 import shutil
@@ -117,6 +119,11 @@ _CONVERSATION_TTL = 30 * 60          # 30 min idle before a thread expires
 _CONVERSATION_MAX_TURNS = 10         # hard cap on turns per thread
 _THREAD_MAX = 100                    # cap on live threads (oldest evicted)
 
+# Multi-image batch (analyze_images): hard caps so one round-trip can't blow the
+# upstream payload or time out. Total-bytes budget bounds the whole batch.
+MAX_BATCH_IMAGES = 4
+MAX_BATCH_TOTAL_BYTES = 25 * 1024 * 1024  # 25 MB total across the whole batch
+
 
 def _prune_expired_threads(now: float | None = None) -> None:
     """Drop idle-expired threads; evict the oldest when over _THREAD_MAX."""
@@ -187,6 +194,42 @@ async def _caption_image(source: dict, prompt: str) -> str:
         config,
         None,  # no custom headers on the MCP path
         None,
+    )
+
+    _caption_cache[cache_key] = caption
+    return caption
+
+
+async def _caption_batch(sources: list[dict], prompt: str) -> str:
+    """Caption MULTIPLE images in ONE user message (cross-image / joint answer).
+
+    All sources travel in a single user message so the vision model can compare
+    them directly. Cached under a single key spanning all sources + prompt (a
+    joint answer can't be cached per-image). Returns the raw caption; raises on
+    failure.
+    """
+    sources_json = json.dumps(sources, sort_keys=True, default=str)
+    cache_key = hashlib.sha256(
+        f"{sources_json}||{prompt}".encode("utf-8")
+    ).hexdigest()
+    cached = _caption_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    key_manager = _build_key_manager()
+    key = key_manager.get_best_key()
+    if not key:
+        raise RuntimeError("No Command Code keys available for vision")
+
+    caption = await _run_caption_call(
+        None,  # source unused when sources is set
+        prompt,
+        key,
+        model_manager,
+        config,
+        None,  # no custom headers on the MCP path
+        None,
+        sources=sources,
     )
 
     _caption_cache[cache_key] = caption
@@ -525,6 +568,68 @@ async def analyze_image_conversation(
     thread.last_access = time.monotonic()
 
     return f"{caption}\n\n[conversation_id={cid}, turn {thread.turn_count}/{_CONVERSATION_MAX_TURNS}]"
+
+
+@mcp.tool()
+async def analyze_images(image_paths: list[str], question: str = "") -> str:
+    """Analyze MULTIPLE image files at once with the configured vision model
+    (gpt-5.6-luna) and return ONE joint answer.
+
+    Use this when you need a true cross-image comparison or joint question in a
+    single round-trip — e.g. "do these show the same person?", "how does the
+    scene change between these frames?", "which of these two has text?". ALL
+    images are sent to the model together in one message, so it can compare them
+    directly (this differs from analyze_image, which handles one image/video).
+
+    Order matters: the images are sent in the order you list them, so reference
+    them by position (e.g. "the first image", "image 2 vs image 4") for
+    "frame 1 vs frame 3"-style questions.
+
+    Args:
+        image_paths: List of absolute paths to image files to analyze together.
+        question: Optional specific cross-image question. When omitted, returns a
+            joint exhaustive description of all images.
+    """
+    if not image_paths:
+        return "ERROR: no image paths provided"
+    if len(image_paths) > MAX_BATCH_IMAGES:
+        return (
+            f"ERROR: too many images ({len(image_paths)} > {MAX_BATCH_IMAGES} max per batch)"
+        )
+
+    total_size = 0
+    for p in image_paths:
+        path = Path(p)
+        if not path.exists():
+            return f"ERROR: file not found: {p}"
+        if not path.is_file():
+            return f"ERROR: path is not a file: {p}"
+        if _is_video(path):
+            return (
+                f"ERROR: video not supported in analyze_images batch: {p} "
+                f"(use analyze_image or analyze_image_conversation for videos)"
+            )
+        size = path.stat().st_size
+        if size > MAX_FILE_BYTES:
+            return f"ERROR: file too large ({size} bytes > {MAX_FILE_BYTES} limit): {p}"
+        total_size += size
+    if total_size > MAX_BATCH_TOTAL_BYTES:
+        return (
+            f"ERROR: total batch size {total_size} bytes exceeds "
+            f"{MAX_BATCH_TOTAL_BYTES} limit"
+        )
+
+    prompt = _build_prompt(question)
+    sources: list[dict] = []
+    for p in image_paths:
+        data = base64.b64encode(Path(p).read_bytes()).decode("utf-8")
+        media_type = mimetypes.guess_type(p)[0] or "image/png"
+        sources.append({"type": "base64", "media_type": media_type, "data": data})
+
+    try:
+        return await _caption_batch(sources, prompt)
+    except Exception as exc:
+        return f"ERROR: vision analysis failed: {exc}"
 
 
 def main() -> None:

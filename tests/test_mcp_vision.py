@@ -39,23 +39,29 @@ class _FakeCaptionCall:
         self.caption = caption
         self.prompt = None
         self.extra_messages = None
+        self.sources = None
 
     async def __call__(self, source, prompt, key=None, model_manager=None,
                        config=None, custom_headers=None, request_id=None, **kwargs):
         self.calls += 1
         self.prompt = prompt
         self.extra_messages = kwargs.get("extra_messages")
+        self.sources = kwargs.get("sources")
         return self.caption
 
 
 @pytest.fixture(autouse=True)
-def _clear_threads():
-    """Isolate the in-process conversation thread dict between tests."""
+def _clear_state():
+    """Isolate the in-process conversation thread dict AND caption cache between
+    tests — the caption cache is keyed by source bytes+prompt, so identical test
+    images across tests would collide and poison each other's call counts."""
     import mcp_proxy_vision.server as srv
 
     srv._THREADS.clear()
+    srv._caption_cache.clear()
     yield
     srv._THREADS.clear()
+    srv._caption_cache.clear()
 
 
 @pytest.mark.asyncio
@@ -255,3 +261,124 @@ async def test_conversation_turn_note_in_prompt(monkeypatch, tmp_path):
         str(img), "Is it a receipt?", turn_note="user says receipt"
     )
     assert "user says receipt" in fake.prompt
+
+
+@pytest.mark.asyncio
+async def test_analyze_images_missing_path(monkeypatch, tmp_path):
+    """A missing path in the batch returns an ERROR without a vision call."""
+    import mcp_proxy_vision.server as srv
+
+    fake = _FakeCaptionCall()
+    monkeypatch.setattr(srv, "_run_caption_call", fake)
+
+    out = await srv.analyze_images(
+        ["C:/nonexistent/definitely_missing.png"]
+    )
+    assert "ERROR" in out
+    assert "not found" in out
+    assert fake.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_analyze_images_two_valid_images_one_call(monkeypatch, tmp_path):
+    """Two valid images → ONE call with 2 sources (all in one user message)."""
+    import mcp_proxy_vision.server as srv
+
+    img1 = _make_temp_image(tmp_path, "a.png", b"aaaa")
+    img2 = _make_temp_image(tmp_path, "b.png", b"bbbb")
+    fake = _FakeCaptionCall(caption="joint answer")
+    monkeypatch.setattr(srv, "_run_caption_call", fake)
+
+    out = await srv.analyze_images([str(img1), str(img2)], "Do they match?")
+
+    assert out == "joint answer"
+    assert fake.calls == 1
+    assert fake.sources is not None
+    assert len(fake.sources) == 2
+    assert all(s["type"] == "base64" for s in fake.sources)
+    assert fake.extra_messages is None
+    assert "describe everything visible" in fake.prompt
+
+
+@pytest.mark.asyncio
+async def test_analyze_images_invalid_one_of_two(monkeypatch, tmp_path):
+    """One invalid member → fail-fast ERROR, no partial vision call."""
+    import mcp_proxy_vision.server as srv
+
+    good = _make_temp_image(tmp_path, "good.png", b"good")
+    fake = _FakeCaptionCall()
+    monkeypatch.setattr(srv, "_run_caption_call", fake)
+
+    out = await srv.analyze_images(
+        [str(good), "C:/nonexistent/missing.png"], "compare"
+    )
+    assert "ERROR" in out
+    assert "not found" in out
+    assert fake.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_analyze_images_batch_cap(monkeypatch, tmp_path):
+    """More than MAX_BATCH_IMAGES images → ERROR, no vision call."""
+    import mcp_proxy_vision.server as srv
+
+    imgs = [_make_temp_image(tmp_path, f"img{i}.png", b"x") for i in range(3)]
+    fake = _FakeCaptionCall()
+    monkeypatch.setattr(srv, "_run_caption_call", fake)
+    monkeypatch.setattr(srv, "MAX_BATCH_IMAGES", 2)
+
+    out = await srv.analyze_images([str(p) for p in imgs], "compare")
+    assert "ERROR" in out
+    assert "too many" in out
+    assert fake.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_analyze_images_total_bytes_cap(monkeypatch, tmp_path):
+    """Batch total exceeding the bytes budget → ERROR, no vision call."""
+    import mcp_proxy_vision.server as srv
+
+    img = _make_temp_image(tmp_path, "a.png", b"123456")
+    fake = _FakeCaptionCall()
+    monkeypatch.setattr(srv, "_run_caption_call", fake)
+    monkeypatch.setattr(srv, "MAX_BATCH_TOTAL_BYTES", 1)
+
+    out = await srv.analyze_images([str(img)], "compare")
+    assert "ERROR" in out
+    assert "total batch size" in out
+    assert fake.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_analyze_images_video_rejected(monkeypatch, tmp_path):
+    """A video in the batch → ERROR directing to single-image tools."""
+    import mcp_proxy_vision.server as srv
+
+    img = _make_temp_image(tmp_path, "a.png", b"x")
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"not a real video but a real file")  # exists, .mp4 ext
+    fake = _FakeCaptionCall()
+    monkeypatch.setattr(srv, "_run_caption_call", fake)
+
+    out = await srv.analyze_images([str(img), str(vid)], "compare")
+    assert "ERROR" in out
+    assert "video not supported" in out
+    assert fake.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_analyze_images_reuses_batch_cache(monkeypatch, tmp_path):
+    """Two identical batch calls → one underlying call (batch cache hit)."""
+    import mcp_proxy_vision.server as srv
+
+    img1 = _make_temp_image(tmp_path, "a.png", b"aaaa")
+    img2 = _make_temp_image(tmp_path, "b.png", b"bbbb")
+    fake = _FakeCaptionCall(caption="joint answer")
+    monkeypatch.setattr(srv, "_run_caption_call", fake)
+
+    paths = [str(img1), str(img2)]
+    out1 = await srv.analyze_images(paths, "Do they match?")
+    out2 = await srv.analyze_images(paths, "Do they match?")
+
+    assert out1 == out2 == "joint answer"
+    assert fake.calls == 1
