@@ -89,6 +89,13 @@ _DEFAULT_QUESTION = (
 # Video extensions treated as video input (frame-extracted + stitched).
 _VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg"}
 
+# Max number of frame captions issued concurrently. A bound of 4 gives ~4x the
+# sequential path without hammering the Command Code gateway or exhausting a
+# small key pool. Kept as one constant (not per-path) to avoid surprising
+# concurrency differences between cached and non-cached paths.
+_VIDEO_MAX_CONCURRENCY = 4
+_VIDEO_MAX_FRAMES = 10  # keep existing cap; at 4-way concurrency ~21s worst case
+
 # Hardcoded fallback ffmpeg build path (used only if ffmpeg isn't on PATH).
 _FFMPEG_FALLBACK = r"C:\Users\ADMIN\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin\ffmpeg"
 
@@ -357,34 +364,61 @@ async def _caption_video_timeline(
     extra_messages: list[ClaudeMessage] | None = None,
     use_cache: bool = True,
 ) -> str:
-    """Extract frames from a video, caption each, stitch into a timeline.
+    """Extract frames from a video, caption each IN PARALLEL, stitch into a timeline.
 
     Same pipeline as ``analyze_image``'s video path. ``extra_messages``, when
     provided, is passed to every frame caption call (prior conversation context).
     ``use_cache=False`` bypasses the flat caption cache (conversation turns 2+).
+
+    Frames are captioned concurrently with a bounded semaphore
+    (``_VIDEO_MAX_CONCURRENCY``) so multi-frame videos don't take ~8.4s/frame
+    sequentially. ``asyncio.gather(..., return_exceptions=True)`` keeps results
+    in frame order regardless of completion order and isolates a single frame's
+    failure so the rest still caption. Output ordering and the ``(N frames
+    analyzed, M failed)`` summary are identical to the sequential version.
     """
     try:
-        frames = await asyncio.to_thread(_extract_frames, path)
+        frames = await asyncio.to_thread(_extract_frames, path, max_frames=_VIDEO_MAX_FRAMES)
     except Exception as exc:
         return f"ERROR: could not extract frames from video: {exc}"
     if not frames:
         return f"ERROR: no frames could be extracted from video: {path}"
     tmpdir = frames[0][0].parent
-    parts = []
+    sem = asyncio.Semaphore(_VIDEO_MAX_CONCURRENCY)
     failed = 0
     try:
+        # Pre-compute labels + sources BEFORE the gather: base64 encode is
+        # CPU-bound (GIL-serialized); doing it inside the tasks would serialize
+        # on the GIL and add nothing to the concurrency win.
+        prepared = []
         for idx, (frame_path, sec) in enumerate(frames, 1):
             mm, ss = int(sec // 60), int(sec % 60)
             data = base64.b64encode(frame_path.read_bytes()).decode("utf-8")
             source = {"type": "base64", "media_type": "image/png", "data": data}
-            try:
+            prepared.append((idx, f"[Frame {idx} ({mm:02d}:{ss:02d})]", source))
+
+        async def _caption_one(item: tuple[int, str, dict]) -> str:
+            _, label, source = item
+            async with sem:
                 caption = await _caption_turn(
                     source, prompt, extra_messages=extra_messages, use_cache=use_cache
                 )
-            except Exception as exc:
+            return f"{label}: {caption}"
+
+        # return_exceptions=True surfaces even CancelledError (a BaseException) as
+        # a result value, so a single frame's failure is counted and doesn't kill
+        # the rest of the timeline.
+        results = await asyncio.gather(
+            *(_caption_one(item) for item in prepared),
+            return_exceptions=True,
+        )
+        parts: list[str] = []
+        for item, result in zip(prepared, results):
+            if isinstance(result, BaseException):
                 failed += 1
-                caption = f"[frame {idx} analysis failed: {exc}]"
-            parts.append(f"[Frame {idx} ({mm:02d}:{ss:02d})]: {caption}")
+                parts.append(f"{item[1]} analysis failed: {result}")
+            else:
+                parts.append(result)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)  # clean up temp frames
     summary = f"\n\n({len(frames)} frames analyzed, {failed} failed)"

@@ -12,6 +12,7 @@ Covers:
     max-turn limit, TTL expiry, missing path, turn_note propagation.
 """
 
+import asyncio
 import time
 
 import pytest
@@ -48,6 +49,65 @@ class _FakeCaptionCall:
         self.extra_messages = kwargs.get("extra_messages")
         self.sources = kwargs.get("sources")
         return self.caption
+
+
+class _GaugeFakeCaptionCall(_FakeCaptionCall):
+    """Tracks max in-flight concurrency and lets frames finish out of order.
+
+    ``delay_per_call`` cycles through per-call delays so some calls finish before
+    others that started earlier, making out-of-order completion observable.
+    """
+
+    def __init__(self, delay_per_call=(0.0,), caption_prefix="cap"):
+        super().__init__()
+        self.delay_per_call = list(delay_per_call)
+        self.caption_prefix = caption_prefix
+        self.max_inflight = 0
+        self.inflight = 0
+        self.source_data = []
+
+    async def __call__(self, source, prompt, key=None, model_manager=None,
+                       config=None, custom_headers=None, request_id=None, **kwargs):
+        self.source_data.append(source["data"])
+        delay = self.delay_per_call[min(len(self.source_data) - 1, len(self.delay_per_call) - 1)]
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        try:
+            if delay:
+                await asyncio.sleep(delay)
+            self.calls += 1
+            return f"{self.caption_prefix} {len(self.source_data)}"
+        finally:
+            self.inflight -= 1
+
+
+def _make_fake_frames(tmp_path, n, data=b"fake-png-bytes"):
+    """Create n fake (frame_path, seconds) pairs WITHOUT ffmpeg.
+
+    Uses a real subdir of tmp_path as the 'temp dir' so the function's
+    shutil.rmtree cleanup removes only the files we created. ``data`` may be a
+    bytes payload (written to every frame) or a sequence of distinct bytes
+    payloads (frame i gets data[i]). Returns the frames list.
+    """
+    d = tmp_path / "vision_frames_test"
+    d.mkdir(exist_ok=True)
+    frames = []
+    for i in range(n):
+        p = d / f"frame_{i:03d}.png"
+        payload = data[i] if isinstance(data, (list, tuple)) else data
+        p.write_bytes(payload)
+        frames.append((p, i * 1.5))  # seconds 0, 1.5, 3.0, ...
+    return frames
+
+
+class _StubKey:
+    api_key = "sk-test"
+    key_id = "test-key"
+
+
+class _StubKeyManager:
+    def get_best_key(self):
+        return _StubKey()
 
 
 @pytest.fixture(autouse=True)
@@ -382,3 +442,152 @@ async def test_analyze_images_reuses_batch_cache(monkeypatch, tmp_path):
 
     assert out1 == out2 == "joint answer"
     assert fake.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_video_timeline_parallel_preserves_order(monkeypatch, tmp_path):
+    """Frames caption in parallel but the timeline output stays in frame order."""
+    import mcp_proxy_vision.server as srv
+
+    frames = _make_fake_frames(tmp_path, 8)
+    fake = _GaugeFakeCaptionCall(delay_per_call=(0.06, 0.02), caption_prefix="cap")
+    monkeypatch.setattr(srv, "_extract_frames", lambda path, max_frames=10: frames)
+    monkeypatch.setattr(srv, "_run_caption_call", fake)
+    monkeypatch.setattr(
+        srv, "_build_key_manager",
+        lambda: _StubKeyManager(),
+    )
+
+    out = await srv._caption_video_timeline(
+        tmp_path / "clip.mp4", "Q", use_cache=False
+    )
+
+    assert fake.max_inflight >= 2  # real concurrency, not serialized
+    # Frame positions strictly ascending in the output.
+    positions = [out.index(f"[Frame {i} (") for i in range(1, 9)]
+    assert positions == sorted(positions)
+    assert "(8 frames analyzed, 0 failed)" in out
+
+
+@pytest.mark.asyncio
+async def test_video_timeline_bounded_concurrency(monkeypatch, tmp_path):
+    """At most _VIDEO_MAX_CONCURRENCY calls are in flight, and the bound is hit."""
+    import mcp_proxy_vision.server as srv
+
+    frames = _make_fake_frames(tmp_path, 8)
+    fake = _GaugeFakeCaptionCall(delay_per_call=(0.03,), caption_prefix="cap")
+    monkeypatch.setattr(srv, "_extract_frames", lambda path, max_frames=10: frames)
+    monkeypatch.setattr(srv, "_run_caption_call", fake)
+    monkeypatch.setattr(srv, "_build_key_manager", lambda: _StubKeyManager())
+    monkeypatch.setattr(srv, "_VIDEO_MAX_CONCURRENCY", 2)
+
+    await srv._caption_video_timeline(tmp_path / "clip.mp4", "Q", use_cache=False)
+
+    assert fake.max_inflight <= 2  # bound never exceeded
+    assert fake.max_inflight == 2  # bound actually reached with 8 frames
+
+
+@pytest.mark.asyncio
+async def test_video_timeline_error_isolation(monkeypatch, tmp_path):
+    """One frame's caption failure doesn't kill the rest of the timeline."""
+    import mcp_proxy_vision.server as srv
+
+    frames = _make_fake_frames(tmp_path, 4)
+
+    class _BoomFake(_GaugeFakeCaptionCall):
+        async def __call__(self, source, prompt, key=None, model_manager=None,
+                           config=None, custom_headers=None, request_id=None, **kwargs):
+            self.source_data.append(source["data"])
+            if len(self.source_data) == 3:  # frame 3 fails
+                raise RuntimeError("boom")
+            self.calls += 1
+            return f"cap {len(self.source_data)}"
+
+    fake = _BoomFake()
+    monkeypatch.setattr(srv, "_extract_frames", lambda path, max_frames=10: frames)
+    monkeypatch.setattr(srv, "_run_caption_call", fake)
+    monkeypatch.setattr(srv, "_build_key_manager", lambda: _StubKeyManager())
+
+    out = await srv._caption_video_timeline(
+        tmp_path / "clip.mp4", "Q", use_cache=False
+    )
+
+    assert "cap 1" in out
+    assert "cap 2" in out
+    assert "[Frame 3 (00:03)] analysis failed: boom" in out
+    assert "cap 4" in out
+    assert "(4 frames analyzed, 1 failed)" in out
+
+
+@pytest.mark.asyncio
+async def test_video_timeline_output_format(monkeypatch, tmp_path):
+    """The stitched timeline format and tmpdir cleanup are correct."""
+    import mcp_proxy_vision.server as srv
+
+    frames = _make_fake_frames(tmp_path, 3)
+    fake = _FakeCaptionCall(caption="a detailed caption")
+    monkeypatch.setattr(srv, "_extract_frames", lambda path, max_frames=10: frames)
+    monkeypatch.setattr(srv, "_run_caption_call", fake)
+    monkeypatch.setattr(srv, "_build_key_manager", lambda: _StubKeyManager())
+
+    out = await srv._caption_video_timeline(
+        tmp_path / "clip.mp4", "Q", use_cache=False
+    )
+
+    expected_lines = [
+        "[Frame 1 (00:00)]: a detailed caption",
+        "[Frame 2 (00:01)]: a detailed caption",
+        "[Frame 3 (00:03)]: a detailed caption",
+    ]
+    assert "\n\n".join(expected_lines) + "\n\n(3 frames analyzed, 0 failed)" == out
+    # tmpdir cleaned up after the gather.
+    assert not (tmp_path / "vision_frames_test").exists()
+
+
+@pytest.mark.asyncio
+async def test_video_timeline_cache_path_uses_flat_cache(monkeypatch, tmp_path):
+    """With use_cache=True, repeated calls hit the flat cache (no re-caption)."""
+    import mcp_proxy_vision.server as srv
+
+    # Distinct byte content per frame so each has its own flat-cache key.
+    fake = _FakeCaptionCall(caption="cached caption")
+
+    def _fresh_frames(path, max_frames=10):
+        # Recreate the frames dir each call (the function's finally rmtree deletes
+        # it), with the SAME distinct-byte content so each flat-cache key matches.
+        return _make_fake_frames(
+            tmp_path, 3,
+            data=(b"frame-one", b"frame-two", b"frame-three"),
+        )
+
+    monkeypatch.setattr(srv, "_extract_frames", _fresh_frames)
+    monkeypatch.setattr(srv, "_run_caption_call", fake)
+    monkeypatch.setattr(srv, "_build_key_manager", lambda: _StubKeyManager())
+
+    # use_cache=True → each frame goes through _caption_image (flat cache).
+    await srv._caption_video_timeline(tmp_path / "clip.mp4", "Q", use_cache=True)
+    await srv._caption_video_timeline(tmp_path / "clip.mp4", "Q", use_cache=True)
+
+    assert fake.calls == 3  # first call captions all 3; second is all cache hits
+
+
+@pytest.mark.asyncio
+async def test_video_timeline_analysis_image_video_integration(monkeypatch, tmp_path):
+    """Full analyze_image video path produces a timeline via parallel captioning."""
+    import mcp_proxy_vision.server as srv
+
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"not a real video but a real file")
+    frames = _make_fake_frames(tmp_path, 3)
+    fake = _FakeCaptionCall(caption="frame caption")
+    monkeypatch.setattr(srv, "_extract_frames", lambda path, max_frames=10: frames)
+    monkeypatch.setattr(srv, "_run_caption_call", fake)
+
+    # Stub the key manager so the test is hermetic (no real keys.json needed).
+    monkeypatch.setattr(srv, "_build_key_manager", lambda: _StubKeyManager())
+
+    out = await srv.analyze_image(str(vid), "What happens?")
+
+    assert "[Frame 1 (00:00)]: frame caption" in out
+    assert "[Frame 3 (00:03)]: frame caption" in out
+    assert "(3 frames analyzed, 0 failed)" in out
